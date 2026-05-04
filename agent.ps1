@@ -14,6 +14,7 @@ param(
     [int]    $PollMs   = 150,    # clipboard poll interval (ms)
     [int]    $MaxChunk = 800,    # max payload bytes per frame
     [int]    $IdleTimeoutSec = 120, # close channels with no client activity
+    [switch] $ClearClipboard,
     [switch] $Debug
 )
 
@@ -163,10 +164,12 @@ $script:outbox    = [System.Collections.Concurrent.ConcurrentQueue[string]]::new
 $script:sendSeq   = [GuacTunnel.SeqCounter]::new((Get-Random -Minimum 1 -Maximum 1000000000))
 
 function Enqueue-Frame {
-    param([int]$Chan, [string]$Ctrl, [byte[]]$Payload = @())
+    param([int]$Chan, [string]$Ctrl, [byte[]]$Payload = @(), [int]$Repeat = 1)
     $seq = $script:sendSeq.Next()
     $frame = New-Frame -Seq $seq -Chan $Chan -Ctrl $Ctrl -Payload $Payload
-    $script:outbox.Enqueue($frame) | Out-Null
+    for ($i = 0; $i -lt [Math]::Max(1, $Repeat); $i++) {
+        $script:outbox.Enqueue($frame) | Out-Null
+    }
     if ($Debug) { Write-Host "[DBG] TX  $frame" }
 }
 
@@ -176,7 +179,7 @@ function Start-ChannelReader {
     param([int]$ChanId, [System.Net.Sockets.NetworkStream]$Stream,
           [System.Collections.Concurrent.ConcurrentQueue[string]]$Outbox,
           [GuacTunnel.SeqCounter]$SeqCounter, [GuacTunnel.BoolBox]$ClosedRef,
-          [int]$ChunkSize)
+          [int]$ChunkSize, [bool]$DebugEnabled)
 
     $rs = [RunspaceFactory]::CreateRunspace()
     $rs.Open()
@@ -187,6 +190,7 @@ function Start-ChannelReader {
     $rs.SessionStateProxy.SetVariable("ClosedRef", $ClosedRef)
     $rs.SessionStateProxy.SetVariable("ChunkSize", $ChunkSize)
     $rs.SessionStateProxy.SetVariable("MAGIC",     "GT")
+    $rs.SessionStateProxy.SetVariable("DebugEnabled", $DebugEnabled)
 
     $ps = [PowerShell]::Create()
     $ps.Runspace = $rs
@@ -200,13 +204,25 @@ function Start-ChannelReader {
                 $seq = $SeqCounter.Next()
                 $b64 = [Convert]::ToBase64String($chunk)
                 $frame = "${MAGIC}:${seq}:${ChanId}:DATA:${b64}"
-                $Outbox.Enqueue($frame)
+                for ($i = 0; $i -lt 3; $i++) {
+                    $Outbox.Enqueue($frame)
+                }
+                if ($DebugEnabled) {
+                    [Console]::WriteLine("[DBG] TCP RX channel {0}: {1} bytes" -f $ChanId, $n)
+                }
             }
-        } catch {}
+        } catch {
+            if ($DebugEnabled) {
+                [Console]::WriteLine("[DBG] TCP reader channel {0} error: {1}" -f $ChanId, $_)
+            }
+        }
         # send CLOSE
         $seq = $SeqCounter.Next()
         $frame = "${MAGIC}:${seq}:${ChanId}:CLOSE:"
         $Outbox.Enqueue($frame)
+        if ($DebugEnabled) {
+            [Console]::WriteLine("[DBG] TCP reader channel {0} closed" -f $ChanId)
+        }
         $ClosedRef.Value = $true
     }) | Out-Null
 
@@ -245,20 +261,12 @@ function Open-Channel {
             ClosedRef = $closed
             RemoteHost = $RemoteHost
             Port = $Port
+            ReaderStarted = $false
             LastActivity = [datetime]::UtcNow
         }
         $script:channels[$ChanId] = $ch
 
         Enqueue-Frame -Chan $ChanId -Ctrl "CONNECTED"
-
-        # reader thread
-        $ch.Reader = Start-ChannelReader `
-            -ChanId   $ChanId `
-            -Stream   $stream `
-            -Outbox   $script:outbox `
-            -SeqCounter $script:sendSeq `
-            -ClosedRef  $ch.ClosedRef `
-            -ChunkSize  $MaxChunk
 
         if ($Debug) { Write-Host "[DBG] Channel $ChanId opened → ${RemoteHost}:${Port}" }
     } catch {
@@ -285,7 +293,22 @@ function Send-DataToChannel {
     try {
         $ch.LastActivity = [datetime]::UtcNow
         $ch.Stream.Write($Data, 0, $Data.Length)
+        $ch.Stream.Flush()
+        if ($Debug) { Write-Host "[DBG] TCP TX channel ${ChanId}: $($Data.Length) bytes" }
+
+        if (-not $ch.ReaderStarted) {
+            $ch.ReaderStarted = $true
+            $ch.Reader = Start-ChannelReader `
+                -ChanId   $ChanId `
+                -Stream   $ch.Stream `
+                -Outbox   $script:outbox `
+                -SeqCounter $script:sendSeq `
+                -ClosedRef  $ch.ClosedRef `
+                -ChunkSize  $MaxChunk `
+                -DebugEnabled ([bool]$Debug)
+        }
     } catch {
+        if ($Debug) { Write-Host "[DBG] TCP TX channel ${ChanId} error: $_" }
         Close-Channel -ChanId $ChanId
     }
 }
@@ -313,6 +336,17 @@ Write-Host "Waiting for operator connection…"
 
 $lastClip    = ""
 $lastTxFrame = ""
+
+if ($ClearClipboard) {
+    try {
+        Write-Clip -s ""
+        $lastClip = ""
+        $lastTxFrame = ""
+        if ($Debug) { Write-Host "[DBG] Clipboard cleared" }
+    } catch {
+        if ($Debug) { Write-Host "[DBG] Clipboard clear error: $_" }
+    }
+}
 
 while ($true) {
     # ── RX: check clipboard for incoming frames ──

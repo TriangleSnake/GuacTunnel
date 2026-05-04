@@ -37,6 +37,7 @@ MAX_PAYLOAD = 800          # bytes before base64 — keeps clipboard text manage
 POLL_INTERVAL = 0.15       # seconds between clipboard flushes
 CONNECT_SETTLE = 0.35      # let clipboard state settle after CONNECTED before DATA
 CONNECT_RETRY = 1.5        # retransmit CONNECT while waiting for CONNECTED
+DATA_REPEATS = 3           # clipboard is lossy; same-seq repeats are deduped
 SEQ_WINDOW = 64            # dedup window size
 
 
@@ -186,15 +187,17 @@ class Channel:
 
 
 class GuacTunnel:
-    def __init__(self, ws_url: str, token: str, conn_id: str, data_source: str = "postgresql"):
+    def __init__(self, ws_url: str, token: str, conn_id: str, data_source: str = "postgresql",
+                 clear_clipboard: bool = False):
         self.ws_url      = ws_url
         self.token       = token
         self.conn_id     = conn_id
         self.data_source = data_source
+        self.clear_clipboard = clear_clipboard
 
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._channels: Dict[int, Channel] = {}
-        self._next_chan = 1
+        self._next_chan = secrets.randbelow(900_000_000) + 1
         self._send_seq  = secrets.randbelow(1_000_000_000)
         self._recv_seen: deque = deque(maxlen=SEQ_WINDOW)
 
@@ -229,6 +232,8 @@ class GuacTunnel:
             ssl=None,
         )
         log.info("WebSocket connected")
+        if self.clear_clipboard:
+            await self._clear_remote_clipboard()
 
     async def run(self):
         await asyncio.gather(
@@ -308,10 +313,11 @@ class GuacTunnel:
 
     # ── internal ──
 
-    async def _enqueue(self, chan: int, ctrl: Ctrl, payload: bytes = b""):
+    async def _enqueue(self, chan: int, ctrl: Ctrl, payload: bytes = b"", repeats: int = 1):
         self._send_seq += 1
         frame = encode_frame(self._send_seq, chan, ctrl, payload)
-        await self._outbox.put(frame)
+        for _ in range(max(1, repeats)):
+            await self._outbox.put(frame)
 
     async def _send_loop(self):
         """Drain outbox → clipboard instructions."""
@@ -331,6 +337,15 @@ class GuacTunnel:
         for instr in instructions:
             await self._ws.send(instr)
         self._stream_id = (self._stream_id % 9999) + 1
+
+    async def _clear_remote_clipboard(self):
+        frame = ""
+        log.debug("Clearing remote clipboard")
+        instructions = guac_send_clipboard(self._stream_id, frame)
+        for instr in instructions:
+            await self._ws.send(instr)
+        self._stream_id = (self._stream_id % 9999) + 1
+        await asyncio.sleep(POLL_INTERVAL)
 
     async def _send_sync(self, timestamp: str):
         """Respond to server sync immediately (outside the outbox queue)."""
@@ -446,7 +461,7 @@ class GuacTunnel:
                 data = await ch.reader.read(MAX_PAYLOAD)
                 if not data:
                     break
-                await self._enqueue(ch.chan_id, Ctrl.DATA, data)
+                await self._enqueue(ch.chan_id, Ctrl.DATA, data, repeats=DATA_REPEATS)
         except Exception as e:
             log.debug("Channel %d reader: %s", ch.chan_id, e)
         finally:
@@ -544,6 +559,8 @@ async def main():
     parser.add_argument("--list-conns", action="store_true",
                         help="Authenticate, list available Guacamole connections, and exit")
     parser.add_argument("--socks",    default="127.0.0.1:1080", help="Local SOCKS5 bind address (default: 127.0.0.1:1080)")
+    parser.add_argument("--clear-clipboard", action="store_true",
+                        help="Clear the Guacamole/RDP clipboard after WebSocket connect")
     parser.add_argument("--debug",    action="store_true")
     args = parser.parse_args()
 
@@ -591,7 +608,7 @@ async def main():
             if args.list_conns:
                 raise
 
-    tunnel = GuacTunnel(ws_url, token, args.conn_id, data_source)
+    tunnel = GuacTunnel(ws_url, token, args.conn_id, data_source, clear_clipboard=args.clear_clipboard)
     await tunnel.connect()
 
     server = await asyncio.start_server(
